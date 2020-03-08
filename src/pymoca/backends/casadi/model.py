@@ -733,11 +733,12 @@ class Model:
         if options['detect_aliases']:
             logger.info("Detecting aliases")
 
-            states = OrderedDict([(s.symbol.name(), s) for s in self.states])
-            der_states = OrderedDict([(s.symbol.name(), s) for s in self.der_states])
-            alg_states = OrderedDict([(s.symbol.name(), s) for s in self.alg_states])
-            inputs = OrderedDict([(s.symbol.name(), s) for s in self.inputs])
-            parameters = OrderedDict([(s.symbol.name(), s) for s in self.parameters])
+            # Map from casadi symbol to pymoca var
+            states = OrderedDict([(s.symbol, s) for s in self.states])
+            der_states = OrderedDict([(s.symbol, s) for s in self.der_states])
+            alg_states = OrderedDict([(s.symbol, s) for s in self.alg_states])
+            inputs = OrderedDict([(s.symbol, s) for s in self.inputs])
+            parameters = OrderedDict([(s.symbol, s) for s in self.parameters])
 
             all_states = OrderedDict()
             all_states.update(states)
@@ -749,166 +750,104 @@ class Model:
             # For now, we only eliminate algebraic states.
             do_not_eliminate = set(list(der_states) + list(states) + list(inputs) + list(parameters))
 
-            def _make_alias(deps, negative_alias=False):
-                """
-                Tries to alias the deps to each other. Returns True if this
-                was possible and done, False otherwise.
-                """
-                if deps[0].name() in alg_states:
-                    alg_state = deps[0]
-                    other_state = deps[1]
-                elif deps[1].name() in alg_states:
-                    alg_state = deps[1]
-                    other_state = deps[0]
+            def select_dep(deps):
+                if deps[0] in do_not_eliminate or deps[0] in self.alias_relation.canonical_variables:
+                    return deps[0], deps[1]
                 else:
-                    alg_state = None
-                    other_state = None
-
-                # If both states are algebraic, we need to decide which to eliminate
-                if deps[0].name() in alg_states and deps[1].name() in alg_states:
-                    # Most of the time it does not matter which one we eliminate.
-                    # The exception is if alg_state has already been aliased to a
-                    # variable in do_not_eliminate. If this is the case, setting the
-                    # states in the default order will cause the new canonical variable
-                    # to be other_state, unseating (and eliminating) the current
-                    # canonical variable (which is in do_not_eliminate).
-                    if self.alias_relation.canonical_signed(alg_state.name())[0] in do_not_eliminate:
-                        # swap the states
-                        other_state, alg_state = alg_state, other_state
-
-                if alg_state is not None:
-                    # Check to see if we are linking two entries in do_not_eliminate
-                    if self.alias_relation.canonical_signed(alg_state.name())[0] in do_not_eliminate and \
-                       self.alias_relation.canonical_signed(other_state.name())[0] in do_not_eliminate:
-                        # Don't do anything for now, we only eliminate alg_states
-                        pass
-
-                    else:
-                        # Eliminate alg_state by aliasing it to other_state
-                        if negative_alias:
-                            self.alias_relation.add(other_state.name(), '-' + alg_state.name())
-                        else:
-                            self.alias_relation.add(other_state.name(), alg_state.name())
-
-                        # To keep equations balanced, drop this equation
-                        return True
-
-                return False
+                    return deps[1], deps[0]
 
             reduced_equations = []
+
             for eq in self.equations:
                 # We do fast checks first, and the slower (but more generic)
-                # checks after.
+                # checks after
+
+                # Only handle additions/subtractions
                 if eq.n_dep() == 2 and (eq.is_op(ca.OP_SUB) or eq.is_op(ca.OP_ADD)):
-                    if eq.dep(0).is_symbolic() and eq.dep(1).is_symbolic():
-                        deps = ca.symvar(eq)
-                        assert len(deps) == 2
-                        if _make_alias(deps, eq.is_op(ca.OP_ADD)): continue
-                elif options['expand_vectors'] and not options['expand_mx']:
-                    # Equation might have many "shadow" dependencies due to
-                    # vector/array expansion. By using .expand() and SX
-                    # symbols for the evaluation, we can figure out what the
-                    # real dependencies are.
-                    s_mx = ca.symvar(eq)
-                    assert all(x.shape == (1, 1) for x in s_mx), "Vector/Matrix SX symbols cannot be mapped"
-                    f = ca.Function('tmp', s_mx, [eq]).expand()
-                    s_sx = [ca.SX.sym(x.name(), *x.shape) for x in s_mx]
-                    eq_sx = f.call(s_sx)[0]
+                    deps = ca.symvar(eq)
 
-                    # Reduced dependencies
-                    deps_sx = ca.symvar(eq_sx)
+                    # Only support equations with 2 variables
+                    if len(deps) == 2:
 
-                    if len(deps_sx) == 2:
-                        # Map SX dependencies back to MX dependencies
-                        deps_map = {k: v for v, k in enumerate(s_sx)}
-                        deps_mx = [s_mx[deps_map[x]] for x in deps_sx]
+                        # Only support algebraic states
+                        if (deps[0] not in do_not_eliminate and deps[0] not in self.alias_relation.canonical_variables) or \
+                                (deps[1] not in do_not_eliminate and deps[0] not in self.alias_relation.canonical_variables):
 
-                        # Simple add/sub expressions in SX equation
-                        if eq_sx.n_dep() == 2 and (eq_sx.is_op(ca.OP_SUB) or eq_sx.is_op(ca.OP_ADD)):
-                            if eq_sx.dep(0).is_symbolic() and eq_sx.dep(1).is_symbolic():
-                                if _make_alias(deps_mx, eq_sx.is_op(ca.OP_ADD)): continue
-
-                        # Check with substitute, which is a more expensive operation
-                        if ca.substitute(eq_sx, deps_sx[0], deps_sx[1]).is_zero():
-                            if _make_alias(deps_mx): continue
-
-                        elif ca.substitute(eq_sx, deps_sx[0], -1 * deps_sx[1]).is_zero():
-                            if _make_alias(deps_mx, True): continue
+                            # Logic to define which variable to keep
+                            canonical, alias = select_dep(deps)
+                            if self.alias_relation.alias_from_equation(eq, canonical, alias):
+                                continue
 
                 # Keep this equation
                 reduced_equations.append(eq)
 
             # Eliminate alias variables
             variables, values = [], []
-            for canonical, aliases in self.alias_relation:
-                canonical_state = all_states[canonical]
+            for canonical_state, aliases in self.alias_relation:
 
-                python_type = canonical_state.python_type
-                start = canonical_state.start
-                m, M = canonical_state.min, canonical_state.max
-                nominal = canonical_state.nominal
-                fixed = canonical_state.fixed
+                python_type = all_states[canonical_state].python_type
+                start = all_states[canonical_state].start
+                m, M = all_states[canonical_state].min, all_states[canonical_state].max
+                nominal = all_states[canonical_state].nominal
+                fixed = all_states[canonical_state].fixed
 
                 for alias in aliases:
-                    if alias[0] == '-':
-                        sign = -1
-                        alias = alias[1:]
-                    else:
-                        sign = 1
 
-                    alias_state = all_states[alias]
+                    if True:
 
-                    variables.append(alias_state.symbol)
-                    values.append(sign * canonical_state.symbol)
+                        alias_state = alias.alias
 
-                    # If any of the aliases has a nonstandard type, apply it to
-                    # the canonical state as well
-                    if alias_state.python_type != float:
-                        python_type = alias_state.python_type
+                        variables.append(alias_state)
+                        values.append(alias.direct)
 
-                    # If any of the aliases has a nondefault start value, apply it to
-                    # the canonical state as well
-                    if not isinstance(alias_state.start, _DefaultValue):
-                        alias_start_mx = ca.MX(alias_state.start)
-                        if not isinstance(start, _DefaultValue):
-                            start_mx = ca.MX(start)
-                            # If the state already has a non-default start
-                            # attribute we check for conflicts.
-                            if (start_mx.is_constant() != ca.MX(alias_start_mx).is_constant()
-                                or (start_mx.is_symbolic() and str(start_mx) != str(sign * alias_start_mx))
-                                or start != alias_start_mx):
+                        # If any of the aliases has a nonstandard type, apply it to
+                        # the canonical state as well
+                        if all_states[alias_state].python_type != float:
+                            python_type = all_states[alias_state].python_type
+                        #
+                        # If any of the aliases has a nondefault start value, apply it to
+                        # the canonical state as well
+                        if not isinstance(all_states[alias_state].start, _DefaultValue):
+                            alias_start_mx = ca.MX(alias.inverse_call(all_states[alias_state].start))
+                            if not isinstance(start, _DefaultValue):
+                                start_mx = ca.MX(start)
+                                # If the state already has a non-default start
+                                # attribute we check for conflicts.
+                                if (start_mx.is_constant() != ca.MX(alias_start_mx).is_constant()
+                                        or (start_mx.is_symbolic() and str(start_mx) != str(sign * alias_start_mx))
+                                        or start != alias_start_mx):
 
-                                logger.warning(
-                                    "Current start attribute of canonical variable '{}' ({})"
-                                    " conflicts with that of its alias '{}' ({})."
-                                    " Will keep existing value of {}."
-                                    .format(canonical, start, alias, alias_start_mx, start))
+                                    logger.warning(
+                                        "Current start attribute of canonical variable '{}' ({})"
+                                        " conflicts with that of its alias '{}' ({})."
+                                        " Will keep existing value of {}."
+                                            .format(canonical_state, start, alias_state, alias_start_mx, start))
+                                else:
+                                    # Alias has equal start attribute, so nothing to do
+                                    pass
                             else:
-                                # Alias has equal start attribute, so nothing to do
-                                pass
-                        else:
-                            start = sign * alias_state.start
+                                start = alias_start_mx
+                        #
+                        # The intersection of all bound ranges applies
+                        M = ca.fmin(M, alias.inverse_call(all_states[alias_state].max))
+                        m = ca.fmax(m, alias.inverse_call(all_states[alias_state].min))
 
-                    # The intersection of all bound ranges applies
-                    m = ca.fmax(m, alias_state.min if sign == 1 else -alias_state.max)
-                    M = ca.fmin(M, alias_state.max if sign == 1 else -alias_state.min)
+                        # Take the largest nominal of all aliases
+                        nominal = ca.fmax(nominal, alias.inverse_call(all_states[alias_state].nominal))
 
-                    # Take the largest nominal of all aliases
-                    nominal = ca.fmax(nominal, alias_state.nominal)
+                        # If any of the aliases is fixed, the canonical state is as well
+                        fixed = ca.fmax(fixed, all_states[alias_state].fixed)
 
-                    # If any of the aliases is fixed, the canonical state is as well
-                    fixed = ca.fmax(fixed, alias_state.fixed)
+                        del all_states[alias_state]
+                        # self.alias_relation.confirm_substitution(alias)
 
-                    del all_states[alias]
-
-                assert isinstance(aliases, set)
-                canonical_state.aliases = aliases
-                canonical_state.python_type = python_type
-                canonical_state.start = start
-                canonical_state.min = m
-                canonical_state.max = M
-                canonical_state.nominal = nominal
-                canonical_state.fixed = fixed
+                all_states[canonical_state].aliases = aliases
+                all_states[canonical_state].python_type = python_type
+                all_states[canonical_state].start = start
+                all_states[canonical_state].min = m
+                all_states[canonical_state].max = M
+                all_states[canonical_state].nominal = nominal
+                all_states[canonical_state].fixed = fixed
 
             self.states = [v for k, v in all_states.items() if k in states]
             self.der_states = [v for k, v in all_states.items() if k in der_states]
@@ -923,7 +862,6 @@ class Model:
                 self.initial_equations = ca.substitute(self.initial_equations, variables, values)
             if len(self.delay_arguments) > 0:
                 self.delay_arguments = self._substitute_delay_arguments(self.delay_arguments, variables, values)
-
         if options['reduce_affine_expression']:
             logger.info("Collapsing model into an affine expression")
 

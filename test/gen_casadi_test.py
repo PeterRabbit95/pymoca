@@ -15,7 +15,7 @@ import numpy as np
 import pymoca.backends.casadi.generator as gen_casadi
 from pymoca.backends.casadi.alias_relation import AliasRelation
 from pymoca.backends.casadi.model import CASADI_ATTRIBUTES, Model, Variable, DelayArgument
-from pymoca.backends.casadi.api import transfer_model, CachedModel
+from pymoca.backends.casadi.api import transfer_model, CachedModel, get_default_options
 from pymoca import parser, ast
 
 
@@ -2343,6 +2343,20 @@ class GenCasadiTest(unittest.TestCase):
         for i in range(4, 8):
             self.assertIsInstance(casadi_model.parameters[i].value, float)
 
+    def test_broader_aliases(self):
+        model_file = os.path.join('models', 'SimpleModel', 'SimpleModel.mo')
+
+        compiler_options = get_default_options()
+
+        compiler_options['replace_constant_expressions'] = True
+        compiler_options['replace_constant_values'] = True
+        compiler_options['replace_parameter_expressions'] = True
+        compiler_options['replace_parameter_values'] = True
+        compiler_options['detect_aliases'] = True
+
+        casadi_model = transfer_model(MODEL_DIR, 'BroaderAliases', compiler_options)
+
+        print(casadi_model)
 
 if __name__ == "__main__":
     unittest.main()
