@@ -5,6 +5,8 @@ import itertools
 import logging
 import re
 import sys
+import copy
+from typing import Any, Dict, List, Union
 
 from pymoca import ast
 
@@ -18,6 +20,7 @@ CASADI_COMPARISON_DEPTH = sys.maxsize
 SUBSTITUTE_LOOP_LIMIT = 100
 SIMPLIFICATION_LOOP_LIMIT = 50
 CASADI_ATTRIBUTES = [attr for attr in ast.Symbol.ATTRIBUTES if not attr == 'unit']
+SYM = Union[ca.SX, ca.MX]
 
 
 class _DefaultValue(int):
@@ -355,6 +358,63 @@ class Model:
 
         # Replace values in metadata
         self._substitute_metadata(symbols, values)
+
+    def _split_dae_alg(self):
+        """Split equations into differential algebraic and algebraic only"""
+        der_states_symbols = ca.vcat(self._symbols(self.der_states))
+        self._ode_equations = []
+        self._alg_equations = []
+        for eq in self.equations:
+            if ca.depends_on(eq, der_states_symbols):
+                self._ode_equations.append(eq)
+            else:
+                self._alg_equations.append(eq)
+
+    def _explicit_odes(self):
+        """Explicit ode equations using first order taylor approximation around 0"""
+        der_states_symbols = self._symbols(self.der_states)
+        self._ode_rhs_lin_equations = []
+
+        ode_equations = copy.deepcopy(self._ode_equations)
+
+        for der_state in der_states_symbols:
+            found = False
+            for ode_eq in ode_equations:
+                if ca.depends_on(ode_eq, der_state):
+                    if not found:
+                        found = True
+
+                        if len(der_states_symbols)>1:
+                            if ca.depends_on(ode_eq, ca.vcat([var for var in der_states_symbols if var is not der_state])):
+                                raise AssertionError('Eq {} depends on more than one derivated state'.format(ode_eq))
+
+                        self._ode_rhs_lin_equations.append(self.tangent_approx(ode_eq, der_state, assert_linear=True))
+                    else:
+                        raise AssertionError('State {} appears in more than on equation'.format(der_state))
+            if not found:
+                raise AssertionError('State {} does not appear in any equation'.format(der_state))
+
+
+    @staticmethod
+    def tangent_approx(f: SYM, x: SYM, a: SYM = None, assert_linear: bool = False) -> Dict[str, SYM]:
+        """
+        Create a tangent approximation of a non-linear function f(x) about point a
+        using a block lower triangular solver
+
+        0 = f(x) = f(a) + J*(x-a)   # taylor series about a (if f(x) linear in x, then globally valid)
+        J*(x-a) = -f(a)             # solve for x
+        x = -J^{-1}f(a) + a        # but inverse is slow, so we use solve
+        where J = df/dx
+        """
+        # find f(a)
+        if a is None:
+            a = ca.DM.zeros(x.numel(), 1)
+        f_a = ca.substitute(f, x, a)  # f(a)
+        J = ca.jacobian(f, x)
+        if assert_linear and ca.depends_on(J, x):
+            raise AssertionError('not linear')
+        # solve is smart enough to to convert to blt if necessary
+        return ca.solve(J, -f_a)
 
     def simplify(self, options):
         options = _merge_default_options(options)
@@ -1009,6 +1069,10 @@ class Model:
             logger.info("Expanded MX functions will be returned")
             self._expand_mx_func = lambda x: x.expand()
 
+        if options['convert_to_semi_explicit_dae']:
+            self._split_dae_alg()
+            self._explicit_odes()
+
         logger.info("Finished model simplification")
 
     @property
@@ -1033,6 +1097,21 @@ class Model:
             return self._expand_mx_func(ca.Function('initial_residual', [self.time, ca.veccat(*self._symbols(self.states)), ca.veccat(*self._symbols(self.der_states)),
                                                 ca.veccat(*self._symbols(self.alg_states)), ca.veccat(*self._symbols(self.inputs)), ca.veccat(*self._symbols(self.constants)),
                                                 ca.veccat(*self._symbols(self.parameters))], [ca.veccat(*self.initial_equations)] if len(self.initial_equations) > 0 else []))
+
+    @property
+    def _ode_dae_semi_explicit_function(self):
+        if hasattr(self, '_ode_rhs_lin_equations'):
+            return ca.Function('ode_dae_semi_explicit', [self.time, ca.veccat(*self._symbols(self.states)), ca.veccat(*self._symbols(self.alg_states)),
+                            ca.veccat(*self._symbols(self.inputs)), ca.veccat(*self._symbols(self.constants)),
+                            ca.veccat(*self._symbols(self.parameters))], [ca.veccat(*self._ode_rhs_lin_equations)])
+
+    @property
+    def _alg_dae_semi_explicit_residual_function(self):
+        if hasattr(self, '_ode_rhs_lin_equations'):
+            return ca.Function('alg_dae_semi_explicit_residual', [self.time, ca.veccat(*self._symbols(self.states)),
+                                                ca.veccat(*self._symbols(self.alg_states)), ca.veccat(*self._symbols(self.inputs)), ca.veccat(*self._symbols(self.constants)),
+                                                ca.veccat(*self._symbols(self.parameters))], [ca.veccat(*self._alg_equations)] if len(self._alg_equations) > 0 else [])
+
 
     # noinspection PyPep8Naming
     @property

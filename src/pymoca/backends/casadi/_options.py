@@ -26,6 +26,7 @@ def _get_default_options():
         'factor_and_simplify_equations': False,
         'detect_aliases': False,
         'reduce_affine_expression': False,
+        'convert_to_semi_explicit_dae': False,
     }
 
 
