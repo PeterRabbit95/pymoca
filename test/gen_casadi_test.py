@@ -2495,7 +2495,7 @@ class GenCasadiTest(unittest.TestCase):
 
         self.assert_model_equations_equivalent(ref_model, casadi_model)
         
-        def test_simplified_variables(self):
+    def test_simplified_variables(self):
         compiler_options = {'eliminate_constant_assignments': True,
                             'factor_and_simplify_equations': True,
                             'replace_constant_expressions': True,
