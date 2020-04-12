@@ -1128,3 +1128,65 @@ class Model:
                  ca.veccat(*self._symbols(self.parameters))],
                 out_arguments))
 
+    def compile_python_script(self, file_name):
+        def fix_type(string):
+            return string.replace('<class ', '').replace('>', '')
+
+        def fix_der_name(string):
+            return re.sub(r'der\((\w+)\)', r'der_\1', string)
+
+        with open(file_name, "w+") as f:
+            f.write('from casadi import inf, sin, fmin, fmax, fmod, fabs, sqrt, floor, sum1, sum2, sumsqr\n')
+            f.write('from numpy import nan\n')
+            f.write('from pymoca.backends.casadi.model import Model, Variable\n')
+
+            f.write('\n\ndef sq(x):\n'
+                    '    return x**2\n\n\n')
+
+            f.write('model = Model()\n')
+
+            f.write('time = model.time\n')
+
+            for var in self.states:
+                f.write(str(var) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.states.append(' + str(var) + ')\n')
+                f.write(str(var) + ' = ' + str(var) +'.symbol\n')
+
+            for var in self.der_states:
+                f.write(fix_der_name(str(var)) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.der_states.append(' + fix_der_name(str(var)) + ')\n')
+                f.write(fix_der_name(str(var)) + ' = ' + fix_der_name(str(var)) + '.symbol\n')
+
+            for var in self.alg_states:
+                f.write(str(var) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.alg_states.append(' + str(var) + ')\n')
+                f.write(str(var) + ' = ' + str(var) + '.symbol\n')
+
+            for var in self.inputs:
+                f.write(str(var) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.inputs.append(' + str(var) + ')\n')
+                f.write(str(var) + ' = ' + str(var) + '.symbol\n')
+
+            for var in self.parameters:
+                f.write(str(var) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.inputs.append(' + str(var) + ')\n')
+                f.write(str(var) + ' = ' + str(var) + '.symbol\n')
+
+            for var in self.constants:
+                f.write(str(var) + ' = Variable.from_dict(' + fix_type(str(var.to_dict())) + ')\n')
+                f.write('model.inputs.append(' + str(var) + ')\n')
+                f.write(str(var) + ' = ' + str(var) + '.symbol\n')
+
+            for eq in self.equations:
+                eq_str = fix_der_name(str(eq))
+
+                at = 1
+
+                while re.search('@' + str(at), string=eq_str):
+                    # res = re.search('@' + str(at) + r'=([\w\d.]*),', string=eq_str)
+                    res = re.search('@' + str(at) + r'=([^,]*),\s', string=eq_str)
+                    eq_str = re.sub(re.escape(res.group(0)), '', eq_str)
+                    eq_str = re.sub('@' + str(at), res.group(1), eq_str)
+                    at += 1
+
+                f.write('model.equations.append(' + eq_str + ')\n')
